@@ -21,7 +21,7 @@ class NASConfig:
     name: str
     configs: list
     max_batches: int = 100_000
-    batch_size: int = 256
+    batch_size: int = 8192
     num_test: int = 5_000
     lr: float = 3e-4
     weight_decay: float = 0.1
