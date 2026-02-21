@@ -1,0 +1,6 @@
+data/
+venv/
+weights/
+NAS_results/*/weights/
+__pycache__/
+*.pyc
