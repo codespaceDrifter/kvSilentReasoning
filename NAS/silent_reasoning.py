@@ -1,12 +1,13 @@
 """Silent Reasoning NAS.
 
-For each architecture config, trains and evaluates 4 models:
-  1. correct_cot:           fresh weights -> train on correct CoT -> test
-  2. silent_cot_curriculum: copy correct_cot weights -> fine-tune on silent CoT -> test
-  3. silent_cot_scratch:    fresh weights -> train on silent CoT (2x batches) -> test
-  4. no_cot:                fresh weights -> train on no-CoT -> test
+Training tree (all variants see 8 epochs total):
+  1. Train correct_cot for 4 epochs -> save checkpoint
+  2. Continue correct_cot for 4 more epochs (8 total) -> test = score 1
+  3. Load checkpoint from step 1 -> train silent_cot for 4 epochs -> test = score 2
+  4. Fresh weights -> train silent_cot for 8 epochs -> test = score 3
+  5. Fresh weights -> train no_cot for 8 epochs -> test = score 4
 
-Search space: layers {1,2,3} x heads {1,2,4} x head_dim {4,8,16} = 27 configs
+Search space: layers {2,3,4} x heads {2,4,8} x head_dim {4,8,16} = 27 configs
 
 Usage: python -m NAS.silent_reasoning
 """
@@ -28,8 +29,8 @@ from model.dataset import BinDataset
 from tokenizer.tokenizer import MulTokenizer
 
 # --- search space ---
-LAYERS = [1, 2, 3, 4]
-HEADS = [1, 2, 4]
+LAYERS = [2, 3, 4]
+HEADS = [2, 4, 8]
 HEAD_DIMS = [4, 8, 16]
 
 # --- training ---
@@ -41,12 +42,13 @@ WEIGHT_DECAY = 0.1
 GRAD_CLIP = 1.0
 USE_FP16 = True
 
-# batch counts
-BASE_BATCHES = 100_000
-# curriculum fine-tuning gets same as base
-CURRICULUM_BATCHES = 100_000
-# scratch silent gets 2x (fair comparison: correct_cot + curriculum = 200k total)
-SCRATCH_BATCHES = 200_000
+# epoch counts for the training tree
+# correct_cot: 4 epochs -> checkpoint -> 4 more epochs
+# curriculum: load checkpoint -> 4 epochs silent_cot
+# scratch: 8 epochs silent_cot
+# no_cot: 8 epochs no_cot
+BRANCH_EPOCHS = 4
+TOTAL_EPOCHS = 8
 
 NUM_TEST = 5_000
 
@@ -69,11 +71,10 @@ def get_configs():
     ]
 
 
-def predict_tokens(model, tokenizer, prefix_ids, max_gen=60):
+def predict_tokens(model, tokenizer, prefix_ids, max_gen=120):
     """Autoregressively generate from prefix until <eos> or max tokens."""
     # (1, prefix_len)
     input_ids = torch.tensor([prefix_ids], device='cuda')
-    # don't exceed model's max_seq_len
     max_gen = min(max_gen, MAX_SEQ_LEN - len(prefix_ids))
 
     with torch.no_grad(), torch.amp.autocast('cuda', enabled=USE_FP16):
@@ -96,15 +97,13 @@ def extract_final_answer(tokens):
     eq_positions = [i for i, t in enumerate(tokens) if t == '=']
     if eq_positions:
         return tokens[eq_positions[-1] + 1:]
-    # no '=' found (no_cot format: everything IS the answer)
     return tokens
 
 
 def test_model(model, tokenizer, test_dataset, num_test=NUM_TEST):
     """Test model accuracy on random examples from test dataset.
 
-    Returns dict with 'complete' (full sequence match) and 'answer' (final answer match)
-    accuracy percentages.
+    Returns dict with 'complete' (full sequence match) and 'answer' (final answer match).
     """
     model.eval()
     equals_id = tokenizer.tok2id['=']
@@ -119,7 +118,6 @@ def test_model(model, tokenizer, test_dataset, num_test=NUM_TEST):
         for idx in indices:
             ids = test_dataset[idx].tolist()
 
-            # find first '=' position
             try:
                 first_eq = ids.index(equals_id)
             except ValueError:
@@ -146,47 +144,52 @@ def test_model(model, tokenizer, test_dataset, num_test=NUM_TEST):
     }
 
 
-def train_model(model, train_loader, equals_id, max_batches, lr=LR):
-    """Train model for max_batches. Returns average loss."""
+def train_epochs(model, loader, equals_id, num_epochs, lr=LR):
+    """Train model for num_epochs over the dataloader. Returns average loss."""
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
     scaler = torch.amp.GradScaler('cuda', enabled=USE_FP16)
 
     total_loss = 0.0
     num_batches = 0
-    train_iter = iter(train_loader)
-    log_interval = max(max_batches // 10, 1000)
 
-    while num_batches < max_batches:
-        try:
-            batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            batch = next(train_iter)
+    for epoch in range(num_epochs):
+        epoch_loss = 0.0
+        epoch_batches = 0
 
-        batch = batch.cuda()
+        for batch in loader:
+            batch = batch.cuda()
 
-        with torch.amp.autocast('cuda', enabled=USE_FP16):
-            loss = model.compute_loss(batch, equals_id)
+            with torch.amp.autocast('cuda', enabled=USE_FP16):
+                loss = model.compute_loss(batch, equals_id)
 
-        optimizer.zero_grad()
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-        scaler.step(optimizer)
-        scaler.update()
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            scaler.step(optimizer)
+            scaler.update()
 
-        total_loss += loss.item()
-        num_batches += 1
+            epoch_loss += loss.item()
+            epoch_batches += 1
 
-        if num_batches % log_interval == 0:
-            print(f'    batch {num_batches}/{max_batches}, loss {loss.item():.4f}')
+        avg_epoch_loss = epoch_loss / epoch_batches
+        total_loss += epoch_loss
+        num_batches += epoch_batches
+        print(f'      epoch {epoch + 1}/{num_epochs}, loss {avg_epoch_loss:.4f}')
 
     return total_loss / num_batches
 
 
 def run_config(config, tokenizer, loaders, test_datasets, equals_id):
-    """Train and evaluate all 4 model variants for one architecture config."""
+    """Train and evaluate all 4 model variants for one architecture config.
+
+    Training tree:
+      correct_cot: 4 epochs -> save -> 4 more epochs -> test
+      curriculum: load saved -> 4 epochs silent_cot -> test
+      scratch: fresh -> 8 epochs silent_cot -> test
+      no_cot: fresh -> 8 epochs no_cot -> test
+    """
     l = config['layers']
     h = config['num_heads']
     hd = config['head_dim']
@@ -209,18 +212,31 @@ def run_config(config, tokenizer, loaders, test_datasets, equals_id):
         ).cuda()
 
     result = {**config}
-    # count params once
     tmp = make_model()
     result['params'] = sum(p.numel() for p in tmp.parameters())
     del tmp; gc.collect(); torch.cuda.empty_cache()
     print(f'params: {result["params"]:,}')
 
-    # --- Score 1: Correct CoT ---
-    print(f'\n  [1/4] correct_cot ({BASE_BATCHES:,} batches)...')
+    # === Correct CoT: 4 epochs -> checkpoint -> 4 more epochs ===
+    print(f'\n  [1/4] correct_cot ({TOTAL_EPOCHS} epochs, branch at {BRANCH_EPOCHS})...')
     model = make_model()
     t0 = time.time()
-    loss = train_model(model, loaders['correct_cot_train'], equals_id, BASE_BATCHES)
+
+    # phase 1: first 4 epochs
+    print(f'    phase 1: {BRANCH_EPOCHS} epochs...')
+    loss1 = train_epochs(model, loaders['correct_cot_train'], equals_id, BRANCH_EPOCHS)
+
+    # save intermediate checkpoint for curriculum branch
+    branch_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+    # phase 2: 4 more epochs
+    remaining = TOTAL_EPOCHS - BRANCH_EPOCHS
+    print(f'    phase 2: {remaining} more epochs...')
+    loss2 = train_epochs(model, loaders['correct_cot_train'], equals_id, remaining)
     train_time = time.time() - t0
+
+    # average loss across both phases
+    loss = (loss1 + loss2) / 2
 
     print(f'  testing correct_cot...')
     acc = test_model(model, tokenizer, test_datasets['correct_cot_test'])
@@ -229,18 +245,15 @@ def run_config(config, tokenizer, loaders, test_datasets, equals_id):
 
     torch.save(model.state_dict(), WEIGHTS_DIR / f'{name}_correct_cot.pt')
     result['correct_cot'] = {**acc, 'loss': round(loss, 4), 'train_time': round(train_time, 1)}
-
-    # save state_dict for curriculum (clone tensors so we can delete model)
-    correct_cot_state = {k: v.clone() for k, v in model.state_dict().items()}
     del model; gc.collect(); torch.cuda.empty_cache()
 
-    # --- Score 2: Silent CoT Curriculum ---
-    print(f'\n  [2/4] silent_cot_curriculum ({CURRICULUM_BATCHES:,} batches)...')
+    # === Silent CoT Curriculum: load branch checkpoint -> 4 epochs ===
+    print(f'\n  [2/4] silent_cot_curriculum ({BRANCH_EPOCHS} epochs from branch)...')
     model = make_model()
-    model.load_state_dict(correct_cot_state)
-    del correct_cot_state
+    model.load_state_dict(branch_state)
+    del branch_state
     t0 = time.time()
-    loss = train_model(model, loaders['silent_cot_train'], equals_id, CURRICULUM_BATCHES)
+    loss = train_epochs(model, loaders['silent_cot_train'], equals_id, BRANCH_EPOCHS)
     train_time = time.time() - t0
 
     print(f'  testing silent_cot_curriculum...')
@@ -252,11 +265,11 @@ def run_config(config, tokenizer, loaders, test_datasets, equals_id):
     result['silent_cot_curriculum'] = {**acc, 'loss': round(loss, 4), 'train_time': round(train_time, 1)}
     del model; gc.collect(); torch.cuda.empty_cache()
 
-    # --- Score 3: Silent CoT Scratch ---
-    print(f'\n  [3/4] silent_cot_scratch ({SCRATCH_BATCHES:,} batches)...')
+    # === Silent CoT Scratch: fresh -> 8 epochs ===
+    print(f'\n  [3/4] silent_cot_scratch ({TOTAL_EPOCHS} epochs)...')
     model = make_model()
     t0 = time.time()
-    loss = train_model(model, loaders['silent_cot_train'], equals_id, SCRATCH_BATCHES)
+    loss = train_epochs(model, loaders['silent_cot_train'], equals_id, TOTAL_EPOCHS)
     train_time = time.time() - t0
 
     print(f'  testing silent_cot_scratch...')
@@ -268,11 +281,11 @@ def run_config(config, tokenizer, loaders, test_datasets, equals_id):
     result['silent_cot_scratch'] = {**acc, 'loss': round(loss, 4), 'train_time': round(train_time, 1)}
     del model; gc.collect(); torch.cuda.empty_cache()
 
-    # --- Score 4: No CoT ---
-    print(f'\n  [4/4] no_cot ({BASE_BATCHES:,} batches)...')
+    # === No CoT: fresh -> 8 epochs ===
+    print(f'\n  [4/4] no_cot ({TOTAL_EPOCHS} epochs)...')
     model = make_model()
     t0 = time.time()
-    loss = train_model(model, loaders['no_cot_train'], equals_id, BASE_BATCHES)
+    loss = train_epochs(model, loaders['no_cot_train'], equals_id, TOTAL_EPOCHS)
     train_time = time.time() - t0
 
     print(f'  testing no_cot...')
@@ -316,7 +329,7 @@ def plot_results(results):
         ax.set_xlabel('Architecture')
         ax.set_xticks(x)
         ax.set_xticklabels(x_labels, fontsize=8)
-        ax.set_title(f'{n_layers} Layer{"s" if n_layers > 1 else ""}')
+        ax.set_title(f'{n_layers} Layers')
         ax.set_ylim(0, 105)
         ax.grid(axis='y', alpha=0.3)
 
@@ -349,21 +362,21 @@ def main():
     print('\nloading datasets...')
     all_splits = TRAIN_SPLITS + TEST_SPLITS
     datasets = {}
-    for name in all_splits:
-        path = DATA_DIR / f'{name}.bin'
+    for split_name in all_splits:
+        path = DATA_DIR / f'{split_name}.bin'
         assert path.exists(), f'missing data file: {path} — run `python -m datagen.generate` first'
-        datasets[name] = BinDataset(str(path), seq_len=MAX_SEQ_LEN)
-        print(f'  {name}: {len(datasets[name]):,} examples')
+        datasets[split_name] = BinDataset(str(path), seq_len=MAX_SEQ_LEN)
+        print(f'  {split_name}: {len(datasets[split_name]):,} examples')
 
-    # train dataloaders (sequential for mmap speed)
+    # train dataloaders (shuffle for epoch-based training)
     loaders = {
-        name: DataLoader(datasets[name], batch_size=BATCH_SIZE, shuffle=False,
-                         num_workers=4, pin_memory=True)
-        for name in TRAIN_SPLITS
+        split_name: DataLoader(datasets[split_name], batch_size=BATCH_SIZE, shuffle=True,
+                               num_workers=4, pin_memory=True)
+        for split_name in TRAIN_SPLITS
     }
 
     # test datasets (accessed by index, not via dataloader)
-    test_datasets = {name: datasets[name] for name in TEST_SPLITS}
+    test_datasets = {split_name: datasets[split_name] for split_name in TEST_SPLITS}
 
     # --- load existing results for resuming ---
     results = []
