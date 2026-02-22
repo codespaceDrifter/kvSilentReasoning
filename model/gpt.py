@@ -78,7 +78,7 @@ class GPT(nn.Module):
         d_model: int = 64,
         n_heads: int = 4,
         n_layers: int = 4,
-        max_seq_len: int = 72,
+        max_seq_len: int = 128,
         dropout: float = 0.1,
         pad_id: int = 0,
     ):

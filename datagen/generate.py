@@ -5,6 +5,15 @@ Output: data/{correct_cot,silent_cot,no_cot}_{train,test}.bin
 
 Each (a,b) pair is assigned to exactly ONE of 6 splits (no overlap).
 Random bucket assignment with weights proportional to desired file sizes.
+
+Digit order in outputs is REVERSED (least significant first) so that carry
+propagation flows in the generation direction. An 'R' token marks reversed
+sections. The final answer after the last '=' is in normal (MSB-first) order.
+
+Formats:
+  correct_cot: <bos> A * B = R rev_partials = R rev_sum = answer <eos>
+  silent_cot:  <bos> A * B = _ _ _ ... _ = answer <eos>  (same length)
+  no_cot:      <bos> A * B = answer <eos>
 """
 
 import random
@@ -14,19 +23,28 @@ from pathlib import Path
 from tokenizer.tokenizer import MulTokenizer
 
 MAX_DIGITS = 5
-SEQ_LEN = 72
+SEQ_LEN = 128
 BYTES_PER_EXAMPLE = SEQ_LEN * 2
 TOTAL_GB = 30
 CHUNK_SIZE = 100_000
 
 
 def num_to_tokens(n):
-    """Convert integer to space-separated digit tokens. e.g. 123 -> '1 2 3'"""
+    """Convert integer to space-separated digit tokens (normal order). e.g. 123 -> '1 2 3'"""
     return ' '.join(str(n))
 
 
+def num_to_tokens_rev(n):
+    """Convert integer to space-separated digit tokens (reversed). e.g. 123 -> '3 2 1'"""
+    return ' '.join(str(n)[::-1])
+
+
 def mul_to_text(a, b):
-    """Correct CoT: A * B = partial_products = result"""
+    """Correct CoT with reversed intermediate digits.
+
+    Format: A * B = R rev_partial1 + rev_partial2 + ... = R rev_sum = answer
+    Single-digit b (no partials to decompose): A * B = R rev_answer = answer
+    """
     result = a * b
     a_tok = num_to_tokens(a)
     b_tok = num_to_tokens(b)
@@ -36,26 +54,26 @@ def mul_to_text(a, b):
     b_digits_rev = b_digits[::-1]
 
     if len(b_digits) == 1:
-        return f"{a_tok} * {b_tok} = {num_to_tokens(result)}"
+        # no partial products to show, just reversed result then normal result
+        return f"{a_tok} * {b_tok} = R {num_to_tokens_rev(result)} = {num_to_tokens(result)}"
 
     # partial products: a * (digit * 10^place) for each digit of b
     partials = [a * d * (10 ** place) for place, d in enumerate(b_digits_rev)]
-    partials_tok = ' + '.join(num_to_tokens(p) for p in partials)
+    partials_tok = ' + '.join(num_to_tokens_rev(p) for p in partials)
 
-    return f"{a_tok} * {b_tok} = {partials_tok} = {num_to_tokens(result)}"
+    return (f"{a_tok} * {b_tok} = R {partials_tok} = "
+            f"R {num_to_tokens_rev(result)} = {num_to_tokens(result)}")
 
 
 def mul_to_text_silent(a, b):
-    """Silent CoT: same structure as correct but intermediate tokens replaced with '_'."""
-    b_digits = [int(d) for d in str(b)]
+    """Silent CoT: same length as correct_cot but intermediate tokens replaced with '_'.
 
-    if len(b_digits) == 1:
-        return f"{num_to_tokens(a)} * {num_to_tokens(b)} = {num_to_tokens(a * b)}"
-
+    Only the final normal-order answer (after last '=') is visible.
+    """
     correct = mul_to_text(a, b)
     tokens = correct.split()
 
-    # find first and last '=' positions
+    # find all '=' positions
     eq_positions = [i for i, t in enumerate(tokens) if t == '=']
     first_eq, last_eq = eq_positions[0], eq_positions[-1]
 
@@ -67,7 +85,7 @@ def mul_to_text_silent(a, b):
 
 
 def mul_to_text_no_cot(a, b):
-    """No CoT: just A * B = result"""
+    """No CoT: just A * B = answer (normal digit order)."""
     return f"{num_to_tokens(a)} * {num_to_tokens(b)} = {num_to_tokens(a * b)}"
 
 

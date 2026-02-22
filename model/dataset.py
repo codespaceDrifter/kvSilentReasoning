@@ -8,7 +8,7 @@ from torch.utils.data import Dataset
 class BinDataset(Dataset):
     """Load pre-tokenized data from binary file."""
 
-    def __init__(self, bin_path: str, seq_len: int = 72):
+    def __init__(self, bin_path: str, seq_len: int = 128):
         # load as memory-mapped array for efficiency with large files
         self.data = np.memmap(bin_path, dtype=np.int16, mode='r')
         # (num_examples, seq_len)

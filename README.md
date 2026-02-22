@@ -10,33 +10,69 @@ The two-phase design is critical. A model trained from scratch with empty CoT an
 
 **Phase 1 — Baseline**: Train a small transformer on long multiplication with correct, legible CoT supervision. The model learns the standard step-by-step algorithm.
 
-**Phase 2 — Silent CoT**: Same architecture, same task, same CoT *length*, but CoT targets are replaced with zero/random tokens. Final correct answer is supervised. The model must learn to repurpose the forward passes through empty tokens as implicit computation steps.
+**Phase 2 — Silent CoT**: Same architecture, same task, same CoT *length*, but CoT targets are replaced with `_` (null) tokens. Final correct answer is supervised. The model must learn to repurpose the forward passes through empty tokens as implicit computation steps.
 
-we comapre these models on accuracy (with same parameter count and training batch):  
+We compare these models on accuracy (with same parameter count and training batch):
 
-1: no COT model  
-2: correct COT model  
-3: Silent COT model that is curriculum learnt FROM a correct COT model  
-4: Silent COT model trained directly  
-5: Silent COT model trained from correct COT model with layer addition and gradient freeze *
+1. **No CoT** — direct `A * B = answer`, no intermediate steps
+2. **Correct CoT** — full chain-of-thought with partial products
+3. **Silent CoT (curriculum)** — trained from correct CoT weights, fine-tuned on null CoT
+4. **Silent CoT (scratch)** — trained directly on null CoT with 2x batches
 
-so for 5, we first train a correct COT model with less layers than other models, then we add a couple of layers, and train on zero/random CoT. with maybe a lower LR on previous layers. the idea is we preserve the weight information on previous layers that carries the correct kv cache information better without making them all just predict 0.  
+## Reversed Digit Order and the R Token
+
+### Why reversed?
+
+Standard left-to-right digit order fights the computation. Consider generating `13 * 5 = 65`:
+- The model must output `6` first (most significant digit)
+- But to know it's `6`, it needs the carry from `3*5=15` (carry 1)
+- So the model must compute the ENTIRE multiplication in a single forward pass just to output the first digit
+
+This is because carry propagation flows right-to-left (least significant to most significant), but autoregressive generation flows left-to-right. Every output digit requires knowing all carries from less significant positions that haven't been generated yet.
+
+### The fix
+
+We reverse the digit order in all computed outputs. An `R` token marks reversed sections:
+
+```
+13 * 45:
+  correct_cot: 1 3 * 4 5 = R 5 6 + 0 2 5 = R 5 8 5 = 5 8 5
+  silent_cot:  1 3 * 4 5 = _ _ _ _ _ _ _ _ _ _ _ _ = 5 8 5
+  no_cot:      1 3 * 4 5 = 5 8 5
+```
+
+Now generating the first output digit `5` (ones place of `13*5=65`):
+- Just compute `(3 * 5) mod 10 = 5`. One multiplication, no carry needed.
+
+Each subsequent digit only needs the carry from the previous step, which was already generated and is visible via attention. This makes each token O(1) computation instead of O(n).
+
+The `R` token marks where reversed digit sequences begin. After the last `=`, the final answer is in normal (human-readable) order — the model just reads its reversed result backwards, which is a trivial attention pattern.
+
+## NAS Search
+
+Grid search over architectures: layers {1,2,3,4} x heads {1,2,4} x head_dim {4,8,16} = 36 configs. Each config trains all 4 model variants.
+
+## Usage
+
+```bash
+# everything (data generation + NAS experiment):
+python -m master
+
+# or separately:
+python -m datagen.generate   # ~30GB data
+python -m NAS.silent_reasoning  # 36 configs x 4 models
+```
 
 ## Key Measurements
 
-- **Accuracy drop**: Compare phase 1 vs phase 2 final answer accuracy
+- **Accuracy drop**: Compare correct CoT vs silent CoT final answer accuracy
 - **CoT ablation**: Randomize KV cache entries from CoT positions at inference. If accuracy drops, the model was using those representations for computation
 - **Attention analysis**: Check whether final-answer tokens attend heavily to CoT-position KV states
 - **Scaling with CoT length**: Does giving the model more empty tokens improve accuracy? If so, it's using them as compute
 
-
-## mech interp
-
-we attempt to find number features using mech interp on inner activations.  
-
 ## Expected Results
 
-If phase 2 accuracy significantly exceeds what's achievable with zero CoT tokens (direct input → answer), the model has learned to exploit meaningless forward passes as working memory — silent reasoning.
+If silent CoT accuracy significantly exceeds no-CoT accuracy, the model has learned to exploit meaningless forward passes as working memory — silent reasoning.
 
 ## Implications
 

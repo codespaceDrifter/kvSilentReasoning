@@ -4,9 +4,10 @@ class MulTokenizer:
         '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
         '*', '+', '=',
         '_',
+        'R',
     ]
-    MAX_SEQ_LEN = 72
-    # index of '=' token for prefix masking
+    MAX_SEQ_LEN = 128
+    # index of '=' token for loss masking
     EQUALS_ID = 15
 
     def __init__(self):

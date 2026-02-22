@@ -28,12 +28,12 @@ from model.dataset import BinDataset
 from tokenizer.tokenizer import MulTokenizer
 
 # --- search space ---
-LAYERS = [1, 2, 3]
+LAYERS = [1, 2, 3, 4]
 HEADS = [1, 2, 4]
 HEAD_DIMS = [4, 8, 16]
 
 # --- training ---
-MAX_SEQ_LEN = 72
+MAX_SEQ_LEN = 128
 DROPOUT = 0.1
 BATCH_SIZE = 8192
 LR = 3e-4
