@@ -12,12 +12,21 @@ The two-phase design is critical. A model trained from scratch with empty CoT an
 
 **Phase 2 — Silent CoT**: Same architecture, same task, same CoT *length*, but CoT targets are replaced with `_` (null) tokens. Final correct answer is supervised. The model must learn to repurpose the forward passes through empty tokens as implicit computation steps.
 
-We compare these models on accuracy (with same parameter count and training batch):
+We compare 4 model variants per architecture, all trained for exactly 8 epochs (fair comparison):
 
-1. **No CoT** — direct `A * B = answer`, no intermediate steps
-2. **Correct CoT** — full chain-of-thought with partial products
-3. **Silent CoT (curriculum)** — trained from correct CoT weights, fine-tuned on null CoT
-4. **Silent CoT (scratch)** — trained directly on null CoT with 2x batches
+```
+correct_cot:  [4 epochs correct] ──checkpoint──> [4 more epochs correct] -> test
+                                        │
+curriculum:                             └──> [4 epochs silent_cot] -> test
+
+scratch:      [8 epochs silent_cot from random init] -> test
+no_cot:       [8 epochs no_cot from random init] -> test
+```
+
+1. **Correct CoT** — 8 epochs on full chain-of-thought with partial products
+2. **Silent CoT (curriculum)** — 4 epochs correct CoT, then 4 epochs null CoT (branches from correct CoT midpoint)
+3. **Silent CoT (scratch)** — 8 epochs on null CoT from random init
+4. **No CoT** — 8 epochs on direct `A * B = answer`, no intermediate steps
 
 ## Reversed Digit Order and the R Token
 
@@ -50,17 +59,13 @@ The `R` token marks where reversed digit sequences begin. After the last `=`, th
 
 ## NAS Search
 
-Grid search over architectures: layers {1,2,3,4} x heads {1,2,4} x head_dim {4,8,16} = 36 configs. Each config trains all 4 model variants.
+Grid search over architectures: layers {2,3,4} x heads {2,4,8} x head_dim {4,8,16} = 27 configs. Each config trains all 4 model variants.
 
 ## Usage
 
 ```bash
-# everything (data generation + NAS experiment):
-python -m master
-
-# or separately:
-python -m datagen.generate   # ~30GB data
-python -m NAS.silent_reasoning  # 36 configs x 4 models
+python -m datagen.generate      # ~30GB data
+python -m NAS.silent_reasoning   # 27 configs x 4 models
 ```
 
 ## Key Measurements

@@ -43,19 +43,16 @@ GRAD_CLIP = 1.0
 USE_FP16 = True
 
 # epoch counts for the training tree
-# correct_cot: 4 epochs -> checkpoint -> 4 more epochs
-# curriculum: load checkpoint -> 4 epochs silent_cot
-# scratch: 8 epochs silent_cot
-# no_cot: 8 epochs no_cot
 BRANCH_EPOCHS = 4
 TOTAL_EPOCHS = 8
 
-NUM_TEST = 5_000
+# 1 batch worth of autoregressive test examples
+NUM_TEST = BATCH_SIZE
 
 # --- paths ---
 DATA_DIR = Path('data')
-RESULTS_DIR = Path('NAS_results/silent_reasoning')
-WEIGHTS_DIR = RESULTS_DIR / 'weights'
+RESULTS_DIR = Path('NAS_results')
+WEIGHTS_DIR = Path('weights')
 LOG_FILE = RESULTS_DIR / 'log.json'
 PLOT_FILE = RESULTS_DIR / 'plot.png'
 
@@ -101,7 +98,7 @@ def extract_final_answer(tokens):
 
 
 def test_model(model, tokenizer, test_dataset, num_test=NUM_TEST):
-    """Test model accuracy on random examples from test dataset.
+    """Test model accuracy via autoregressive generation.
 
     Returns dict with 'complete' (full sequence match) and 'answer' (final answer match).
     """
@@ -114,29 +111,28 @@ def test_model(model, tokenizer, test_dataset, num_test=NUM_TEST):
     complete_match = 0
     answer_match = 0
 
-    with torch.amp.autocast('cuda', enabled=USE_FP16):
-        for idx in indices:
-            ids = test_dataset[idx].tolist()
+    for idx in indices:
+        ids = test_dataset[idx].tolist()
 
-            try:
-                first_eq = ids.index(equals_id)
-            except ValueError:
-                continue
+        try:
+            first_eq = ids.index(equals_id)
+        except ValueError:
+            continue
 
-            # prefix: everything up to and including first '='
-            prefix_ids = ids[:first_eq + 1]
+        # prefix: everything up to and including first '='
+        prefix_ids = ids[:first_eq + 1]
 
-            # expected: everything after first '=', excluding specials
-            expected_tokens = [tokenizer.id2tok[x] for x in ids[first_eq + 1:]
-                               if x not in (tokenizer.pad_id, tokenizer.bos_id, tokenizer.eos_id)]
+        # expected: everything after first '=', excluding specials
+        expected_tokens = [tokenizer.id2tok[x] for x in ids[first_eq + 1:]
+                           if x not in (tokenizer.pad_id, tokenizer.bos_id, tokenizer.eos_id)]
 
-            pred_tokens = predict_tokens(model, tokenizer, prefix_ids)
+        pred_tokens = predict_tokens(model, tokenizer, prefix_ids)
 
-            if pred_tokens == expected_tokens:
-                complete_match += 1
+        if pred_tokens == expected_tokens:
+            complete_match += 1
 
-            if extract_final_answer(pred_tokens) == extract_final_answer(expected_tokens):
-                answer_match += 1
+        if extract_final_answer(pred_tokens) == extract_final_answer(expected_tokens):
+            answer_match += 1
 
     return {
         'complete': round(complete_match / n * 100, 1),
@@ -182,14 +178,7 @@ def train_epochs(model, loader, equals_id, num_epochs, lr=LR):
 
 
 def run_config(config, tokenizer, loaders, test_datasets, equals_id):
-    """Train and evaluate all 4 model variants for one architecture config.
-
-    Training tree:
-      correct_cot: 4 epochs -> save -> 4 more epochs -> test
-      curriculum: load saved -> 4 epochs silent_cot -> test
-      scratch: fresh -> 8 epochs silent_cot -> test
-      no_cot: fresh -> 8 epochs no_cot -> test
-    """
+    """Train and evaluate all 4 model variants for one architecture config."""
     l = config['layers']
     h = config['num_heads']
     hd = config['head_dim']
@@ -222,20 +211,17 @@ def run_config(config, tokenizer, loaders, test_datasets, equals_id):
     model = make_model()
     t0 = time.time()
 
-    # phase 1: first 4 epochs
     print(f'    phase 1: {BRANCH_EPOCHS} epochs...')
     loss1 = train_epochs(model, loaders['correct_cot_train'], equals_id, BRANCH_EPOCHS)
 
     # save intermediate checkpoint for curriculum branch
     branch_state = {k: v.clone() for k, v in model.state_dict().items()}
 
-    # phase 2: 4 more epochs
     remaining = TOTAL_EPOCHS - BRANCH_EPOCHS
     print(f'    phase 2: {remaining} more epochs...')
     loss2 = train_epochs(model, loaders['correct_cot_train'], equals_id, remaining)
     train_time = time.time() - t0
 
-    # average loss across both phases
     loss = (loss1 + loss2) / 2
 
     print(f'  testing correct_cot...')
@@ -375,7 +361,7 @@ def main():
         for split_name in TRAIN_SPLITS
     }
 
-    # test datasets (accessed by index, not via dataloader)
+    # test datasets (accessed by index for autoregressive eval)
     test_datasets = {split_name: datasets[split_name] for split_name in TEST_SPLITS}
 
     # --- load existing results for resuming ---
@@ -402,7 +388,6 @@ def main():
         with open(LOG_FILE, 'w') as f:
             json.dump(results, f, indent=2)
 
-        # update plot after each config
         plot_results(results)
 
     # --- summary ---
