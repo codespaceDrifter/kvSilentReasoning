@@ -1,13 +1,13 @@
 """Silent Reasoning NAS.
 
-Training tree (all variants see 8 epochs total):
-  1. Train correct_cot for 4 epochs -> save checkpoint
-  2. Continue correct_cot for 4 more epochs (8 total) -> test = score 1
-  3. Load checkpoint from step 1 -> train silent_cot for 4 epochs -> test = score 2
-  4. Fresh weights -> train silent_cot for 8 epochs -> test = score 3
-  5. Fresh weights -> train no_cot for 8 epochs -> test = score 4
+Training tree (BRANCH_EPOCHS=B, TOTAL_EPOCHS=T):
+  1. Train correct_cot for B epochs -> save checkpoint
+  2. Continue correct_cot for T-B more epochs -> test = score 1
+  3. Load checkpoint from step 1 -> train silent_cot for B epochs -> test = score 2
+  4. Fresh weights -> train silent_cot for T epochs -> test = score 3
+  5. Fresh weights -> train no_cot for T epochs -> test = score 4
 
-Search space: layers {2,3,4} x heads {2,4,8} x head_dim {4,8,16} = 27 configs
+Search space: layers {2,3,4} x heads {2,4,8} x head_dim {16,32,64} = 27 configs
 
 Usage: python -m NAS.silent_reasoning
 """
@@ -31,7 +31,7 @@ from tokenizer.tokenizer import MulTokenizer
 # --- search space ---
 LAYERS = [2, 3, 4]
 HEADS = [2, 4, 8]
-HEAD_DIMS = [4, 8, 16]
+HEAD_DIMS = [16, 32, 64]
 
 # --- training ---
 MAX_SEQ_LEN = 128
@@ -46,7 +46,7 @@ USE_FP16 = True
 BRANCH_EPOCHS = 1
 TOTAL_EPOCHS = 1
 
-NUM_TEST = 8192
+NUM_TEST = 16384
 
 # --- paths ---
 DATA_DIR = Path('data')
@@ -217,11 +217,13 @@ def run_config(config, tokenizer, loaders, test_datasets, equals_id):
     branch_state = {k: v.clone() for k, v in model.state_dict().items()}
 
     remaining = TOTAL_EPOCHS - BRANCH_EPOCHS
-    print(f'    phase 2: {remaining} more epochs...')
-    loss2 = train_epochs(model, loaders['correct_cot_train'], equals_id, remaining)
+    if remaining > 0:
+        print(f'    phase 2: {remaining} more epochs...')
+        loss2 = train_epochs(model, loaders['correct_cot_train'], equals_id, remaining)
+        loss = (loss1 + loss2) / 2
+    else:
+        loss = loss1
     train_time = time.time() - t0
-
-    loss = (loss1 + loss2) / 2
 
     print(f'  testing correct_cot...')
     acc = test_model(model, tokenizer, test_datasets['correct_cot_test'])

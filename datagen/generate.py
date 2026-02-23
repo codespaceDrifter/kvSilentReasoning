@@ -27,7 +27,7 @@ SEQ_LEN = 128
 BYTES_PER_EXAMPLE = SEQ_LEN * 2
 # train size in GB (per format file; total on disk = TRAIN_GB * 3 + test)
 TRAIN_GB = 10
-NUM_TEST = 8192
+NUM_TEST = 16384
 CHUNK_SIZE = 100_000
 
 FORMATS = ['correct_cot', 'silent_cot', 'no_cot']
