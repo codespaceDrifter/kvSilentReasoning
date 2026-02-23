@@ -43,11 +43,10 @@ GRAD_CLIP = 1.0
 USE_FP16 = True
 
 # epoch counts for the training tree
-BRANCH_EPOCHS = 4
-TOTAL_EPOCHS = 8
+BRANCH_EPOCHS = 1
+TOTAL_EPOCHS = 1
 
-# 1 batch worth of autoregressive test examples
-NUM_TEST = BATCH_SIZE
+NUM_TEST = 8192
 
 # --- paths ---
 DATA_DIR = Path('data')

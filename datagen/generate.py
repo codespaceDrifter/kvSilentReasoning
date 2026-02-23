@@ -3,8 +3,8 @@
 Usage: python -m datagen.generate
 Output: data/{correct_cot,silent_cot,no_cot}_{train,test}.bin
 
-Each (a,b) pair is assigned to exactly ONE of 6 splits (no overlap).
-Random bucket assignment with weights proportional to desired file sizes.
+Same (a,b) pairs across all 3 formats. Test set is exactly 8192 pairs,
+generated first with a separate RNG seed. Train set fills the rest.
 
 Digit order in outputs is REVERSED (least significant first) so that carry
 propagation flows in the generation direction. An 'R' token marks reversed
@@ -22,11 +22,15 @@ from pathlib import Path
 
 from tokenizer.tokenizer import MulTokenizer
 
-MAX_DIGITS = 5
+MAX_DIGITS = 4
 SEQ_LEN = 128
 BYTES_PER_EXAMPLE = SEQ_LEN * 2
-TOTAL_GB = 30
+# train size in GB (per format file; total on disk = TRAIN_GB * 3 + test)
+TRAIN_GB = 10
+NUM_TEST = 8192
 CHUNK_SIZE = 100_000
+
+FORMATS = ['correct_cot', 'silent_cot', 'no_cot']
 
 
 def num_to_tokens(n):
@@ -54,7 +58,6 @@ def mul_to_text(a, b):
     b_digits_rev = b_digits[::-1]
 
     if len(b_digits) == 1:
-        # no partial products to show, just reversed result then normal result
         return f"{a_tok} * {b_tok} = R {num_to_tokens_rev(result)} = {num_to_tokens(result)}"
 
     # partial products: a * (digit * 10^place) for each digit of b
@@ -73,11 +76,9 @@ def mul_to_text_silent(a, b):
     correct = mul_to_text(a, b)
     tokens = correct.split()
 
-    # find all '=' positions
     eq_positions = [i for i, t in enumerate(tokens) if t == '=']
     first_eq, last_eq = eq_positions[0], eq_positions[-1]
 
-    # replace everything between first '=' and last '=' with '_'
     for i in range(first_eq + 1, last_eq):
         tokens[i] = '_'
 
@@ -102,21 +103,36 @@ FORMAT_FNS = {
     'no_cot': mul_to_text_no_cot,
 }
 
-# 6 buckets: each (a,b) pair goes to exactly one
-# weights: 4 train + 1 test per format = 5 per format, 3 formats = 15 total
-BUCKETS = [
-    ('correct_cot', 'train', 4),
-    ('correct_cot', 'test',  1),
-    ('silent_cot',  'train', 4),
-    ('silent_cot',  'test',  1),
-    ('no_cot',      'train', 4),
-    ('no_cot',      'test',  1),
-]
-# bucket keys
-BUCKET_KEYS = [f'{fmt}_{split}' for fmt, split, _ in BUCKETS]
-# cumulative weights for np.searchsorted
-BUCKET_WEIGHTS = np.array([w for _, _, w in BUCKETS], dtype=np.float64)
-BUCKET_CDF = np.cumsum(BUCKET_WEIGHTS / BUCKET_WEIGHTS.sum())
+
+def generate_split(n_pairs, rng, tokenizer, files, label):
+    """Generate n_pairs and write all 3 formats to the corresponding files."""
+    generated = 0
+    while generated < n_pairs:
+        chunk_size = min(CHUNK_SIZE, n_pairs - generated)
+
+        # buffers per format
+        buffers = {fmt: [] for fmt in FORMATS}
+
+        for _ in range(chunk_size):
+            d1 = rng.randint(1, MAX_DIGITS)
+            d2 = rng.randint(1, MAX_DIGITS)
+            a, b = random_pair(d1, d2, rng)
+
+            for fmt, fn in FORMAT_FNS.items():
+                text = fn(a, b)
+                ids = tokenizer.encode(text, pad=True)
+                assert len(ids) == SEQ_LEN, \
+                    f"seq len {len(ids)} != {SEQ_LEN}: {a} * {b} ({fmt})"
+                buffers[fmt].append(ids)
+
+        for fmt, rows in buffers.items():
+            arr = np.array(rows, dtype=np.int16)
+            arr.tofile(files[fmt])
+
+        generated += chunk_size
+        if generated % (CHUNK_SIZE * 10) == 0 or generated >= n_pairs:
+            pct = generated / n_pairs * 100
+            print(f'  {label}: {generated:,}/{n_pairs:,} ({pct:.0f}%)')
 
 
 def main():
@@ -125,65 +141,29 @@ def main():
 
     tokenizer = MulTokenizer()
 
-    # total pairs to generate (each becomes 1 example in 1 of 6 files)
-    n_total = int(TOTAL_GB * (1024 ** 3) / BYTES_PER_EXAMPLE)
+    n_train = int(TRAIN_GB * (1024 ** 3) / BYTES_PER_EXAMPLE)
 
-    print(f'generating {n_total:,} examples across 6 splits (no overlap)')
-    print(f'target: ~{TOTAL_GB} GB total')
-    print(f'bucket weights: {", ".join(f"{k}={w}" for k, (_, _, w) in zip(BUCKET_KEYS, BUCKETS))}')
+    print(f'test:  {NUM_TEST:,} pairs (same across all 3 formats)')
+    print(f'train: {n_train:,} pairs ({TRAIN_GB} GB per format)')
 
-    rng = random.Random(42)
-    np_rng = np.random.RandomState(42)
+    # --- test: 8192 pairs, seed 0 ---
+    test_files = {fmt: open(data_dir / f'{fmt}_test.bin', 'wb') for fmt in FORMATS}
+    generate_split(NUM_TEST, random.Random(0), tokenizer, test_files, 'test')
+    for f in test_files.values():
+        f.close()
 
-    # open all 6 files simultaneously
-    files = {k: open(data_dir / f'{k}.bin', 'wb') for k in BUCKET_KEYS}
-    counts = {k: 0 for k in BUCKET_KEYS}
-
-    generated = 0
-    while generated < n_total:
-        chunk_size = min(CHUNK_SIZE, n_total - generated)
-
-        # assign each example to a bucket via CDF lookup
-        rolls = np_rng.random(chunk_size)
-        # bucket index per example
-        bucket_ids = np.searchsorted(BUCKET_CDF, rolls)
-
-        # buffers per bucket
-        buffers = {k: [] for k in BUCKET_KEYS}
-
-        for idx in range(chunk_size):
-            d1 = rng.randint(1, MAX_DIGITS)
-            d2 = rng.randint(1, MAX_DIGITS)
-            a, b = random_pair(d1, d2, rng)
-
-            bucket_key = BUCKET_KEYS[bucket_ids[idx]]
-            # format is determined by which bucket this pair landed in
-            fmt = bucket_key.rsplit('_', 1)[0]
-            text = FORMAT_FNS[fmt](a, b)
-            ids = tokenizer.encode(text, pad=True)
-            assert len(ids) == SEQ_LEN, \
-                f"seq len {len(ids)} != {SEQ_LEN}: {a} * {b} ({fmt})"
-            buffers[bucket_key].append(ids)
-
-        for key, rows in buffers.items():
-            if rows:
-                arr = np.array(rows, dtype=np.int16)
-                arr.tofile(files[key])
-                counts[key] += len(rows)
-
-        generated += chunk_size
-        if generated % (CHUNK_SIZE * 10) == 0 or generated >= n_total:
-            pct = generated / n_total * 100
-            print(f'  {generated:,}/{n_total:,} ({pct:.0f}%)')
-
-    for f in files.values():
+    # --- train: fill the rest, seed 42 ---
+    train_files = {fmt: open(data_dir / f'{fmt}_train.bin', 'wb') for fmt in FORMATS}
+    generate_split(n_train, random.Random(42), tokenizer, train_files, 'train')
+    for f in train_files.values():
         f.close()
 
     print(f'\ndone! file sizes:')
-    for key in sorted(counts):
-        path = data_dir / f'{key}.bin'
-        size_gb = path.stat().st_size / (1024 ** 3)
-        print(f'  {key}: {counts[key]:,} examples ({size_gb:.2f} GB)')
+    for split in ('test', 'train'):
+        for fmt in FORMATS:
+            path = data_dir / f'{fmt}_{split}.bin'
+            size_gb = path.stat().st_size / (1024 ** 3)
+            print(f'  {fmt}_{split}: {size_gb:.2f} GB')
 
 
 if __name__ == '__main__':
