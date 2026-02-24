@@ -12,21 +12,24 @@ The two-phase design is critical. A model trained from scratch with empty CoT an
 
 **Phase 2 — Silent CoT**: Same architecture, same task, same CoT *length*, but CoT targets are replaced with `_` (null) tokens. Final correct answer is supervised. The model must learn to repurpose the forward passes through empty tokens as implicit computation steps.
 
-We compare 4 model variants per architecture. With `BRANCH_EPOCHS=B` and `TOTAL_EPOCHS=T`:
+We compare 5 model variants per architecture. With `BRANCH_EPOCHS=B`, `TOTAL_EPOCHS=T`, and `L` base layers:
 
 ```
-correct_cot:  [B epochs correct] ──checkpoint──> [T-B more epochs correct] -> test
-                                        │
-curriculum:                             └──> [B epochs silent_cot] -> test
+correct_cot:              [B epochs correct, L layers] ──checkpoint──> [T-B more epochs] -> test
+                                                              │
+curriculum:                                                  ├──> [B epochs silent_cot, L layers] -> test
+                                                              │
+add_on_layer_curriculum:                                     └──> [+1 random layer, L+1 layers] -> [B epochs silent_cot] -> test
 
-scratch:      [T epochs silent_cot from random init] -> test
-no_cot:       [T epochs no_cot from random init] -> test
+scratch:                  [T epochs silent_cot, L layers, from random init] -> test
+no_cot:                   [T epochs no_cot, L layers, from random init] -> test
 ```
 
 1. **Correct CoT** — T epochs on full chain-of-thought with partial products
-2. **Silent CoT (curriculum)** — B epochs correct CoT, then B epochs null CoT (branches from correct CoT checkpoint)
-3. **Silent CoT (scratch)** — T epochs on null CoT from random init
-4. **No CoT** — T epochs on direct `A * B = answer`, no intermediate steps
+2. **Silent CoT (curriculum)** — B epochs correct CoT, then B epochs null CoT (same architecture)
+3. **Add-on Layer (curriculum)** — B epochs correct CoT, then add 1 randomly initialized layer, then B epochs null CoT. Tests whether extra capacity on top of learned representations enables silent reasoning.
+4. **Silent CoT (scratch)** — T epochs on null CoT from random init
+5. **No CoT** — T epochs on direct `A * B = answer`, no intermediate steps
 
 ## Reversed Digit Order and the R Token
 
@@ -59,7 +62,7 @@ The `R` token marks where reversed digit sequences begin. After the last `=`, th
 
 ## NAS Search
 
-Grid search over architectures: layers {2,3,4} x heads {2,4,8} x head_dim {16,32,64} = 27 configs. Each config trains all 4 model variants.
+Grid search over architectures: layers {2} x heads {2,4,8} x head_dim {32,64} = 6 configs. Each config trains all 5 model variants.
 
 ## Usage
 

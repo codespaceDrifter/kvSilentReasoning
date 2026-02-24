@@ -1,13 +1,14 @@
 """Silent Reasoning NAS.
 
-Training tree (BRANCH_EPOCHS=B, TOTAL_EPOCHS=T):
-  1. Train correct_cot for B epochs -> save checkpoint
+Training tree (BRANCH_EPOCHS=B, TOTAL_EPOCHS=T, L=base layers):
+  1. Train correct_cot (L layers) for B epochs -> save checkpoint
   2. Continue correct_cot for T-B more epochs -> test = score 1
-  3. Load checkpoint from step 1 -> train silent_cot for B epochs -> test = score 2
-  4. Fresh weights -> train silent_cot for T epochs -> test = score 3
-  5. Fresh weights -> train no_cot for T epochs -> test = score 4
+  3. Load checkpoint -> train silent_cot (L layers) for B epochs -> test = score 2
+  4. Load checkpoint -> add 1 random layer (L+1 layers) -> train silent_cot for B epochs -> test = score 3
+  5. Fresh weights -> train silent_cot (L layers) for T epochs -> test = score 4
+  6. Fresh weights -> train no_cot (L layers) for T epochs -> test = score 5
 
-Search space: layers {2,3,4} x heads {2,4,8} x head_dim {16,32,64} = 27 configs
+Search space: layers {2} x heads {2,4,8} x head_dim {32,64} = 6 configs
 
 Usage: python -m NAS.silent_reasoning
 """
@@ -29,9 +30,9 @@ from model.dataset import BinDataset
 from tokenizer.tokenizer import MulTokenizer
 
 # --- search space ---
-LAYERS = [2, 3, 4]
+LAYERS = [2]
 HEADS = [2, 4, 8]
-HEAD_DIMS = [16, 32, 64]
+HEAD_DIMS = [32, 64]
 
 # --- training ---
 MAX_SEQ_LEN = 128
@@ -177,7 +178,7 @@ def train_epochs(model, loader, equals_id, num_epochs, lr=LR):
 
 
 def run_config(config, tokenizer, loaders, test_datasets, equals_id):
-    """Train and evaluate all 4 model variants for one architecture config."""
+    """Train and evaluate all 5 model variants for one architecture config."""
     l = config['layers']
     h = config['num_heads']
     hd = config['head_dim']
@@ -188,12 +189,12 @@ def run_config(config, tokenizer, loaders, test_datasets, equals_id):
     print(f'Config: {name} (d_model={d})')
     print(f'{"="*60}')
 
-    def make_model():
+    def make_model(n_layers=l):
         return GPT(
             vocab_size=len(tokenizer),
             d_model=d,
             n_heads=h,
-            n_layers=l,
+            n_layers=n_layers,
             max_seq_len=MAX_SEQ_LEN,
             dropout=DROPOUT,
             pad_id=tokenizer.pad_id,
@@ -205,15 +206,15 @@ def run_config(config, tokenizer, loaders, test_datasets, equals_id):
     del tmp; gc.collect(); torch.cuda.empty_cache()
     print(f'params: {result["params"]:,}')
 
-    # === Correct CoT: 4 epochs -> checkpoint -> 4 more epochs ===
-    print(f'\n  [1/4] correct_cot ({TOTAL_EPOCHS} epochs, branch at {BRANCH_EPOCHS})...')
+    # === Correct CoT: B epochs -> checkpoint -> T-B more epochs ===
+    print(f'\n  [1/5] correct_cot ({TOTAL_EPOCHS} epochs, branch at {BRANCH_EPOCHS})...')
     model = make_model()
     t0 = time.time()
 
     print(f'    phase 1: {BRANCH_EPOCHS} epochs...')
     loss1 = train_epochs(model, loaders['correct_cot_train'], equals_id, BRANCH_EPOCHS)
 
-    # save intermediate checkpoint for curriculum branch
+    # save intermediate checkpoint for curriculum branches
     branch_state = {k: v.clone() for k, v in model.state_dict().items()}
 
     remaining = TOTAL_EPOCHS - BRANCH_EPOCHS
@@ -234,11 +235,10 @@ def run_config(config, tokenizer, loaders, test_datasets, equals_id):
     result['correct_cot'] = {**acc, 'loss': round(loss, 4), 'train_time': round(train_time, 1)}
     del model; gc.collect(); torch.cuda.empty_cache()
 
-    # === Silent CoT Curriculum: load branch checkpoint -> 4 epochs ===
-    print(f'\n  [2/4] silent_cot_curriculum ({BRANCH_EPOCHS} epochs from branch)...')
+    # === Silent CoT Curriculum: load branch checkpoint -> B epochs ===
+    print(f'\n  [2/5] silent_cot_curriculum ({BRANCH_EPOCHS} epochs from branch)...')
     model = make_model()
     model.load_state_dict(branch_state)
-    del branch_state
     t0 = time.time()
     loss = train_epochs(model, loaders['silent_cot_train'], equals_id, BRANCH_EPOCHS)
     train_time = time.time() - t0
@@ -252,8 +252,30 @@ def run_config(config, tokenizer, loaders, test_datasets, equals_id):
     result['silent_cot_curriculum'] = {**acc, 'loss': round(loss, 4), 'train_time': round(train_time, 1)}
     del model; gc.collect(); torch.cuda.empty_cache()
 
-    # === Silent CoT Scratch: fresh -> 8 epochs ===
-    print(f'\n  [3/4] silent_cot_scratch ({TOTAL_EPOCHS} epochs)...')
+    # === Add-on Layer Curriculum: load branch into L+1 layer model -> B epochs ===
+    print(f'\n  [3/5] add_on_layer_curriculum ({BRANCH_EPOCHS} epochs, {l}→{l+1} layers)...')
+    model = make_model(n_layers=l + 1)
+    # copy trained weights into matching layers; the extra block stays random
+    extended_state = model.state_dict()
+    for key, val in branch_state.items():
+        extended_state[key] = val
+    model.load_state_dict(extended_state)
+    del branch_state
+    t0 = time.time()
+    loss = train_epochs(model, loaders['silent_cot_train'], equals_id, BRANCH_EPOCHS)
+    train_time = time.time() - t0
+
+    print(f'  testing add_on_layer_curriculum...')
+    acc = test_model(model, tokenizer, test_datasets['silent_cot_test'])
+    print(f'  add_on_layer_curriculum: complete={acc["complete"]}% answer={acc["answer"]}% '
+          f'loss={loss:.4f} time={train_time:.0f}s')
+
+    torch.save(model.state_dict(), WEIGHTS_DIR / f'{name}_add_on_layer_curriculum.pt')
+    result['add_on_layer_curriculum'] = {**acc, 'loss': round(loss, 4), 'train_time': round(train_time, 1)}
+    del model; gc.collect(); torch.cuda.empty_cache()
+
+    # === Silent CoT Scratch: fresh -> T epochs ===
+    print(f'\n  [4/5] silent_cot_scratch ({TOTAL_EPOCHS} epochs)...')
     model = make_model()
     t0 = time.time()
     loss = train_epochs(model, loaders['silent_cot_train'], equals_id, TOTAL_EPOCHS)
@@ -268,8 +290,8 @@ def run_config(config, tokenizer, loaders, test_datasets, equals_id):
     result['silent_cot_scratch'] = {**acc, 'loss': round(loss, 4), 'train_time': round(train_time, 1)}
     del model; gc.collect(); torch.cuda.empty_cache()
 
-    # === No CoT: fresh -> 8 epochs ===
-    print(f'\n  [4/4] no_cot ({TOTAL_EPOCHS} epochs)...')
+    # === No CoT: fresh -> T epochs ===
+    print(f'\n  [5/5] no_cot ({TOTAL_EPOCHS} epochs)...')
     model = make_model()
     t0 = time.time()
     loss = train_epochs(model, loaders['no_cot_train'], equals_id, TOTAL_EPOCHS)
@@ -288,40 +310,29 @@ def run_config(config, tokenizer, loaders, test_datasets, equals_id):
 
 
 def plot_results(results):
-    """Grouped bar chart: 4 accuracy scores per config, subplots by layer count."""
-    score_types = ['correct_cot', 'silent_cot_curriculum', 'silent_cot_scratch', 'no_cot']
-    colors = ['#2ecc71', '#3498db', '#e67e22', '#e74c3c']
-    labels = ['Correct CoT', 'Silent CoT (curriculum)', 'Silent CoT (scratch)', 'No CoT']
+    """Grouped bar chart: 5 accuracy scores per config."""
+    score_types = ['correct_cot', 'silent_cot_curriculum', 'add_on_layer_curriculum', 'silent_cot_scratch', 'no_cot']
+    colors = ['#2ecc71', '#3498db', '#9b59b6', '#e67e22', '#e74c3c']
+    labels = ['Correct CoT', 'Silent (curriculum)', 'Add-on Layer (curriculum)', 'Silent (scratch)', 'No CoT']
 
-    fig, axes = plt.subplots(1, len(LAYERS), figsize=(7 * len(LAYERS), 6), sharey=True)
-    if len(LAYERS) == 1:
-        axes = [axes]
+    sorted_results = sorted(results, key=lambda r: (r['num_heads'], r['head_dim']))
+    x_labels = [f"H={r['num_heads']}\nHD={r['head_dim']}" for r in sorted_results]
+    x = np.arange(len(sorted_results))
+    width = 0.15
 
-    for ax, n_layers in zip(axes, LAYERS):
-        layer_results = sorted(
-            [r for r in results if r['layers'] == n_layers],
-            key=lambda r: (r['num_heads'], r['head_dim']),
-        )
-        if not layer_results:
-            continue
+    fig, ax = plt.subplots(figsize=(max(10, len(sorted_results) * 2), 6))
 
-        x_labels = [f"H={r['num_heads']}\nHD={r['head_dim']}" for r in layer_results]
-        x = np.arange(len(layer_results))
-        width = 0.18
+    for i, (score_type, color, label) in enumerate(zip(score_types, colors, labels)):
+        values = [r.get(score_type, {}).get('answer', 0) for r in sorted_results]
+        ax.bar(x + (i - 2) * width, values, width, label=label, color=color)
 
-        for i, (score_type, color, label) in enumerate(zip(score_types, colors, labels)):
-            values = [r.get(score_type, {}).get('answer', 0) for r in layer_results]
-            ax.bar(x + (i - 1.5) * width, values, width, label=label, color=color)
-
-        ax.set_xlabel('Architecture')
-        ax.set_xticks(x)
-        ax.set_xticklabels(x_labels, fontsize=8)
-        ax.set_title(f'{n_layers} Layers')
-        ax.set_ylim(0, 105)
-        ax.grid(axis='y', alpha=0.3)
-
-    axes[0].set_ylabel('Answer Accuracy (%)')
-    axes[-1].legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=9)
+    ax.set_xlabel('Architecture')
+    ax.set_xticks(x)
+    ax.set_xticklabels(x_labels, fontsize=8)
+    ax.set_ylabel('Answer Accuracy (%)')
+    ax.set_ylim(0, 105)
+    ax.grid(axis='y', alpha=0.3)
+    ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=9)
 
     plt.suptitle('Silent Reasoning NAS: Answer Accuracy', fontsize=14)
     plt.tight_layout()
@@ -372,7 +383,9 @@ def main():
             results = json.load(f)
         print(f'\nloaded {len(results)} existing results')
 
-    done_keys = {(r['layers'], r['num_heads'], r['head_dim']) for r in results}
+    # require all 5 variants present to count as done
+    done_keys = {(r['layers'], r['num_heads'], r['head_dim']) for r in results
+                 if 'add_on_layer_curriculum' in r}
 
     # --- run all configs ---
     for i, config in enumerate(configs):
@@ -398,21 +411,18 @@ def main():
     print(f'plot: {PLOT_FILE}')
     print('=' * 60)
 
-    print('\nTop 5 by correct_cot answer accuracy:')
-    by_acc = sorted(results, key=lambda r: r['correct_cot']['answer'], reverse=True)
-    for r in by_acc[:5]:
-        print(f"  L={r['layers']} H={r['num_heads']} HD={r['head_dim']}: "
-              f"correct={r['correct_cot']['answer']}% "
-              f"curriculum={r['silent_cot_curriculum']['answer']}% "
-              f"scratch={r['silent_cot_scratch']['answer']}% "
-              f"no_cot={r['no_cot']['answer']}%")
-
-    print('\nTop 5 by silent_cot_curriculum answer accuracy:')
-    by_acc = sorted(results, key=lambda r: r['silent_cot_curriculum']['answer'], reverse=True)
-    for r in by_acc[:5]:
-        print(f"  L={r['layers']} H={r['num_heads']} HD={r['head_dim']}: "
-              f"curriculum={r['silent_cot_curriculum']['answer']}% "
-              f"(correct={r['correct_cot']['answer']}%)")
+    # only summarize results that have all 5 variants
+    complete = [r for r in results if 'add_on_layer_curriculum' in r]
+    if complete:
+        print('\nTop by correct_cot answer accuracy:')
+        by_acc = sorted(complete, key=lambda r: r['correct_cot']['answer'], reverse=True)
+        for r in by_acc[:5]:
+            print(f"  L={r['layers']} H={r['num_heads']} HD={r['head_dim']}: "
+                  f"correct={r['correct_cot']['answer']}% "
+                  f"curriculum={r['silent_cot_curriculum']['answer']}% "
+                  f"add_on={r['add_on_layer_curriculum']['answer']}% "
+                  f"scratch={r['silent_cot_scratch']['answer']}% "
+                  f"no_cot={r['no_cot']['answer']}%")
 
 
 if __name__ == '__main__':
